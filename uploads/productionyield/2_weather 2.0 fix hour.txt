@@ -1,0 +1,348 @@
+#include <Arduino_GFX_Library.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <sys/time.h>
+#include <WiFiUdp.h> // 添加此头文件
+#include <NTPClient.h> // 添加此头文件
+
+
+
+WebServer server(80);
+DNSServer dnsServer;
+
+int currentline;
+// 硬件配置
+#define LCD_BL 1
+Arduino_DataBus *bus = new Arduino_ESP32SPI(42, 45, 39, 38, 40);    // DC,CS,SCK,MOSI,MISO
+Arduino_GFX *gfx = new Arduino_ST7789(bus, -1, 1, true, 240, 320);  // RST,旋转,IPS,宽,高
+
+// WiFi 配置存储
+Preferences prefs; // 使用 Preferences 库
+const char* ap_ssid = "ESP32-Config";
+const char* ap_password = "config1234";
+String ssid = "Richard4";
+String testid="";
+String password = "richardji"; // 使用 String 类型
+String city = "";
+// 将变量名 min 改为 minutes
+int minutes = 0; 
+bool wifi_connected = false;
+bool configCompleted=false;
+WiFiUDP ntpUDP;
+// 28800 是 UTC+8 时区偏移量，60000 是更新间隔（毫秒）
+NTPClient timeClient(ntpUDP, "ntp.aliyun.com", 28800, 60000);
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial; margin:20px;} input{margin:10px 0; padding:5px; width:100%;}</style>";
+  html += "</head><body>";
+  html += "<h2>WiFi Configuration</h2>";
+  html += "<form method='post' action='/submit'>";
+  html += "SSID:<br><input type='text' name='ssid' required><br>";
+  html += "Password:<br><input type='password' name='password' required><br>";
+  html += "City:<br><input type='text' name='city' required><br>";
+  html += "<input type='submit' value='Save'>";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSubmit() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  String city = server.arg("city");
+
+  if (ssid.isEmpty() || password.isEmpty() || city.isEmpty()) {
+    server.send(400, "text/plain", "All fields are required!");
+    return;
+  }
+
+  prefs.begin("wifi-config", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("password", password);
+  prefs.putString("city", city);
+  prefs.end();
+  ss("--Save config ssid="+ssid);
+  //test saved config
+  // 读取操作（必须重新打开）
+prefs.begin("wifi-config", true); // true表示只读模式
+String testid = prefs.getString("ssid", "");
+ss("--Try load ssid="+testid);
+prefs.end();
+
+  server.send(200, "text/html", "<h1>Configuration saved! Device will restart...</h1>");
+  delay(1000);
+  configCompleted = true;
+}
+
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  IPAddress apIP(192, 168, 4, 1);
+  ss("--Sub function ()");
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ap_ssid, ap_password);
+
+  dnsServer.start(53, "*", apIP);
+  ss("--DNS 192.168.4.1");
+  server.on("/", handleRoot);
+  server.on("/submit", HTTP_POST, handleSubmit);
+  server.begin();
+
+  while (!configCompleted) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    delay(10);
+  }
+
+  server.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+}
+
+
+void initLCD() {
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+  gfx->begin();
+  gfx->fillScreen(BLACK);
+  gfx->setTextColor(0xFFFF);
+  gfx->setTextSize(2);
+}
+void ss(const String &msg) {
+  static int lastLine = 10;
+  //gfx->fillRect(0, lastLine, 240, 20, BLACK); // 取消注释清屏功能
+  gfx->setCursor(10, currentline);
+  gfx->println(msg);
+  // 添加这一行，将信息通过串口输出
+  Serial.println(msg); 
+  lastLine = currentline;
+  currentline += 18;
+  if(currentline >= 240) {
+    currentline = 10;
+    gfx->fillScreen(BLACK); // 全屏清空改为局部清空
+  }
+}
+bool connectWiFi() {
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  ss("---try wifi 20times");
+  WiFi.begin(ssid.c_str(), password.c_str());
+  for(int i=0; i<20; i++){
+    if(WiFi.status() == WL_CONNECTED) {
+      ss("RSSI: " + String(WiFi.RSSI()));
+      //wifi_connected=true;
+      return true;
+    }
+    delay(1000);
+  }
+  return false;
+}
+
+
+
+
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  initLCD();
+  ss("Richard Weather");
+  //check wifi config
+  ss("Loading flash config");
+    // 读取存储配置
+    // 读取操作（必须重新打开）
+  prefs.begin("wifi-config", true); // true表示只读模式
+  String testid = prefs.getString("ssid", "");
+  ssid = prefs.getString("ssid", "");
+  password = prefs.getString("password", "");
+  city = prefs.getString("city", "");
+  ss("Read WIFI="+ssid);
+  ss("city="+city);
+  prefs.end();
+  // 尝试连接WiFi
+  if (ssid.length() && password.length() >= 8) {
+    ss("Found saved config");
+    if (connectWiFi()) {
+      ss("WIFI Connected...");
+      ss(WiFi.localIP().toString());
+      wifi_connected = true;
+  
+      // 初始化 NTP 客户端
+      timeClient.begin();
+      timeClient.update();
+  
+      // 获取当前时间
+      String currentTime = timeClient.getFormattedTime();
+      currentTime = currentTime.substring(0, 5); // 截取前 5 个字符，即 HH:MM
+      ss("Current Time: " + currentTime);
+  
+      gethour();
+      drawhour();
+    }else{
+      ss("WIFI Not Connect!");
+      wifi_connected = false;
+      startAPMode();
+    }
+  }else{
+    ss("Not found config, AP{");
+    
+    startAPMode();
+    ss("AP END,restart}");
+    ss("5s restart...");
+    delay(1000);
+    ss("4s restart...");
+    delay(1000);
+    ss("3s restart...");
+    delay(1000);
+    ss("2s restart...");
+    delay(1000);
+    ss("1s restart...");
+    delay(1000);
+    // 修改为正确的重启函数调用
+    ESP.restart(); 
+}
+
+
+}
+void gethour(){
+
+}
+void drawhour() {
+    // 清屏
+    gfx->fillScreen(BLACK);
+
+    // 获取当前时间
+    timeClient.update();
+    String currentTime = timeClient.getFormattedTime();
+    String hours = currentTime.substring(0, 2);
+    String minutes = currentTime.substring(3, 5);
+
+    // 获取当前日期和星期几
+    String dateStr = getDateAndWeekday();
+
+    // 设置文本样式
+    gfx->setTextColor(0xFFFF);
+    gfx->setTextSize(6); // 增大字体大小
+
+    // 计算时分文本居中位置
+    int16_t x1, y1;
+    uint16_t w, h;
+    gfx->getTextBounds(hours + minutes, 0, 0, &x1, &y1, &w, &h);
+    int centerX = (320 - w) / 2;
+    int centerY = (80 - h) / 2; // 靠上面一点
+
+    // 显示小时
+    gfx->setCursor(centerX, centerY);
+    gfx->println(hours);
+
+    // 计算小时文本宽度
+    gfx->getTextBounds(hours, 0, 0, &x1, &y1, &w, &h);
+    int hoursWidth = w;
+
+    // 显示冒号，设置为红色
+    gfx->setTextColor(0xF800); // 红色
+    gfx->setCursor(centerX + hoursWidth, centerY);
+    gfx->println(":");
+
+    // 计算冒号文本宽度
+    gfx->getTextBounds(":", 0, 0, &x1, &y1, &w, &h);
+    int colonWidth = w;
+
+    // 显示分钟
+    gfx->setTextColor(0xFFFF);
+    gfx->setCursor(centerX + hoursWidth + colonWidth, centerY);
+    gfx->println(minutes);
+
+    // 显示月日和周几
+    gfx->setTextSize(2); // 显示的小一点
+    gfx->getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+    centerX = (240 - w) / 2;
+    // 将月日显示位置往下移动
+    centerY = centerY + h + 40; 
+    gfx->setCursor(centerX, centerY);
+    // 获取当前日期和星期几
+    time_t rawtime = timeClient.getEpochTime();
+     // 获取Unix时间戳（需转换为本地时区）
+unsigned long epoch = timeClient.getEpochTime();
+int days = epoch / 86400;  // 总天数
+int seconds = epoch % 86400; // 当天剩余秒数
+
+// 计算年（已优化闰年逻辑）
+int year = 1970;
+int leap;
+while (true) {
+    leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 1 : 0;
+    if (days < 365 + leap) break;
+    days -= 365 + leap;
+    year++;
+}
+
+// 月份天数表（索引0为1月）
+const int monthDays[] = {31,28+leap,31,30,31,30,31,31,30,31,30,31};
+
+// 计算月和日
+int month;
+for (month = 0; month < 12; month++) {
+    if (days < monthDays[month]) break;
+    days -= monthDays[month];
+}
+int day = days + 1;  // 天数从0开始
+
+// 计算星期几（0=周日,1=周一...6=周六）
+int weekday = (epoch / 86400 + 4) % 7; // 1970-01-01为周四
+
+String monthday = String(year) + "-" + String(month + 1) + "-" + String(day);
+const char* weekdayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+String weekdayStr = weekdayNames[weekday];
+monthday += " " + weekdayStr;
+// 输出结果：2023-12-05
+    gfx->println(monthday);
+
+    // 在LCD右上角画wifi标识
+    int wifiIconX = 320 - 30; // 右上角位置，向右移到最右边
+    int wifiIconY = 18;
+    // 修改WiFi标识为圆弧，并旋转135°
+    gfx->drawArc(wifiIconX, wifiIconY, 8, 8, 230, 330, 0x07E0);
+    gfx->drawArc(wifiIconX, wifiIconY, 12, 12, 230, -30, 0x07E0);
+    gfx->drawArc(wifiIconX, wifiIconY, 16, 16, 230, -30, 0x07E0);
+    gfx->setCursor(wifiIconX - 20, wifiIconY);
+    // gfx->println("WiFi OK");
+}
+
+String getDateAndWeekday() {
+    time_t rawtime;
+    struct tm * timeinfo;
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    const char* weekdayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    int month = timeinfo->tm_mon + 1;
+    int day = timeinfo->tm_mday;
+    int weekday = timeinfo->tm_wday;
+
+    String dateStr = String(month) + "-" + String(day) + " " + String(weekdayNames[weekday]);
+    return dateStr;
+}
+
+// 修改loop函数
+void loop() {
+    if (wifi_connected && minutes % 60 == 0) {
+      // 获取当前时间
+    timeClient.update();
+        /* 定期更新时间
+        timeClient.update();
+        String currentTime = timeClient.getFormattedTime();
+        currentTime = currentTime.substring(0, 5); // 截取前 5 个字符，即 HH:MM
+        ss("Current Time: " + currentTime);*/
+        drawhour();
+      
+        minutes = 0;
+    }
+    minutes += 1;
+    delay(1000); // 改为短延迟保持响应
+}
